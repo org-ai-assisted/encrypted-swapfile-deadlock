@@ -65,6 +65,11 @@ The harness drives a nested Debian 13 VirtualBox VM. The shape is:
 `swapmode.sh` also provides the known-safe modes for comparison:
 `enc-loop-dd-dio`, `enc-blockdev`, `zram`, `plain-file`.
 
+The SSH-driven scripts authenticate with the `id_repro` key. The serial-console
+driver (`serialctl.py`, used by the matrix runners) logs in with a password; set
+`REPRO_SERIAL_PW` to whatever password you gave the guest in `cloud-init/user-data`
+(both default to the same placeholder).
+
 ## The fix (validated)
 
 Raise `vm.min_free_kbytes` on low-RAM systems, only ever upward, e.g.

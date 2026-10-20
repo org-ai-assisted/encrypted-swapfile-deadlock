@@ -1,7 +1,10 @@
 #cloud-config
 hostname: swaprepro
 disable_root: false
-ssh_pwauth: true
+# Key-only SSH: the host harness logs in with the id_repro key, never a
+# password. The password below exists ONLY for the serial console and is a
+# placeholder -- change it, and set REPRO_SERIAL_PW for serialctl.py to match.
+ssh_pwauth: false
 chpasswd:
   expire: false
   users:

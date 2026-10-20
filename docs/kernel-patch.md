@@ -60,18 +60,52 @@ near-exhaustion point. 0 of 3 fix runs survived.
 (An earlier single-layer build -- loop worker only -- behaved the same: it
 swapped a few hundred MB then hard-locked.)
 
-## Why the patch does not help: size vs access
+## Why the patch does not help
+
+Two reasons, both checked against the Linux 6.12.113 source. The reserve grant
+is largely *ineffective* at the layers it was applied to, and where it does take
+effect it only shares out the same small pool faster.
+
+### 1. The reserve grant is defeated at both layers
+
+`memalloc_noreclaim_save()` sets `PF_MEMALLOC`, which grants an allocation
+`ALLOC_NO_WATERMARKS` (dip into reserves) -- *unless* the allocation itself opts
+out with `__GFP_NOMEMALLOC`. Both patched layers opt out:
+
+- **dm-crypt.** `crypt_alloc_buffer()` allocates the bounce pages with
+  `alloc_pages(gfp_mask | __GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN |
+  __GFP_COMP, order)`, and its fallback is `mempool_alloc(&cc->page_pool, ...)`.
+  `mempool_alloc()` itself ORs in `__GFP_NOMEMALLOC` ("don't allocate emergency
+  reserves", `mm/mempool.c`). So the crypt buffer allocation explicitly refuses
+  reserves regardless of `PF_MEMALLOC`; the dm-crypt wrap is a no-op for it. (A
+  mempool *is* the layer's own bounded reserve, which is why it opts out of the
+  global one.)
+- **loop.** For the direct-I/O path (`losetup --direct-io=on`, i.e. the path the
+  patch targets) `loop_queue_rq` sets `cmd->use_aio = lo->use_dio`, so
+  `lo_rw_aio()` submits asynchronously and returns `-EIOCBQUEUED`; the backing-file
+  write *completes later* in `lo_rw_aio_complete()` on another context. The
+  `memalloc_noreclaim_save/restore` brackets only the synchronous submission in
+  the loop worker, not that completion -- and the re-entrant allocation that
+  matters (ext4 extent / jbd2 journal work on writeback, under `GFP_NOFS`) runs in
+  the completion context, which never had `PF_MEMALLOC`.
+
+This also matches the observation below that the box still drove `MemFree` into
+the reserve band and wedged near exhaustion: the one allocation the wrap *did*
+cover (loop submission) is not the one that closes the circular wait.
+
+### 2. Even an effective grant would be size, not access
 
 `PF_MEMALLOC` grants *access* to the existing reserve pool; it does not make the
 pool *bigger*. The deadlock is not one allocation that just needs permission to
 dip into reserves -- it is many concurrent in-flight swap writes whose
 completion each needs a little memory, collectively exceeding the small default
-reserve (~28 MB on 640 MB RAM). Giving every layer access to that same ~28 MB
-pool lets them drain it faster and then block anyway.
+reserve (~28 MB on 640 MB RAM). Even where access is granted, sharing that same
+~28 MB pool across every layer just drains it faster and then blocks anyway.
 
-Raising `vm.min_free_kbytes` works for exactly the complementary reason: it
-enlarges the pool (to 64-128 MB) so the in-flight writes can all complete. That
-is a *size* fix, and it is the one that empirically works (see `docs/findings.md`).
+Raising `vm.min_free_kbytes` works for the complementary reason: it enlarges the
+pool (to 64-128 MB) so the watermark-based allocations throughout the chain have
+headroom and the in-flight writes can all complete. That is a *size* fix, and it
+is the one that empirically works (see `docs/findings.md`).
 
 ## Conclusion
 

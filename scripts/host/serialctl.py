@@ -9,13 +9,16 @@
 
 Exit: 0 ok, 124 timeout/frozen, 2 no-shell.
 """
-import sys, time, argparse, re
+import sys, os, time, argparse, re
 import pexpect
 
 PROMPT = r"RPMARK> "
 SETPS1 = "export PROMPT_COMMAND=; export PS1='RP''MARK> '"
 BPOFF  = "bind 'set enable-bracketed-paste off' 2>/dev/null; true"
-PW = "reproswap123"
+# Serial-console login password. MUST match the password set in
+# cloud-init/user-data (same placeholder by default); override via env when you
+# provision the guest with a different one.
+PW = os.environ.get("REPRO_SERIAL_PW", "CHANGEME-throwaway")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 def clean(s): return ANSI.sub("", s or "").replace("\r", "")
