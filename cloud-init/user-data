@@ -1,0 +1,115 @@
+#cloud-config
+hostname: swaprepro
+disable_root: false
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  users:
+    - {name: root, password: CHANGEME-throwaway, type: text}
+    - {name: debian, password: CHANGEME-throwaway, type: text}
+users:
+  - name: debian
+    sudo: 'ALL=(ALL) NOPASSWD:ALL'
+    lock_passwd: false
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID7J/edkEdpviBOcaKN6F1IVI+3YIeXVdPw1cNXk2jDH repro
+  - name: root
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID7J/edkEdpviBOcaKN6F1IVI+3YIeXVdPw1cNXk2jDH repro
+package_update: true
+packages:
+  - cryptsetup
+  - python3
+write_files:
+  - path: /root/filler.py
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/python3
+      # Gradually fill memory; log progress + mem/swap to a file and to the
+      # serial console so a hard lockup is visible as a stalled heartbeat.
+      import time, sys
+      def meminfo():
+          d={}
+          for ln in open('/proc/meminfo'):
+              k,v=ln.split(':'); d[k]=v.strip()
+          return d
+      log=open('/root/fill.log','w',buffering=1)
+      try:
+          con=open('/dev/console','w',buffering=1)
+      except Exception:
+          con=None
+      count=0; mem=[]
+      t0=time.time()
+      while True:
+          mem.append(bytearray(1024*1024))  # 1 MiB real pages (written)
+          for i in range(0,len(mem[-1]),4096):
+              mem[-1][i]=1
+          count+=1
+          mi=meminfo()
+          line="t=%.1f n=%dMiB MemFree=%s SwapFree=%s/%s" % (
+              time.time()-t0, count, mi.get('MemFree'),
+              mi.get('SwapFree'), mi.get('SwapTotal'))
+          log.write(line+"\n")
+          if con:
+              try: con.write("FILL "+line+"\n")
+              except Exception: pass
+          time.sleep(0.05)
+  - path: /root/swapmode.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      # Tear down any swap, then set up the requested swap mode.
+      #   enc-loop-fallocate : OLD swap-file-creator path (dm-crypt/plain over
+      #                        loop over fallocate'd 8G file)  -> expected DEADLOCK
+      #   enc-loop-dd-dio    : same but file dd-filled + loop direct-io=on
+      #   enc-blockdev       : dm-crypt plain over a real block device (/dev/sdb)
+      #   zram               : compressed RAM swap (no disk)
+      #   plain-file         : plain (unencrypted) swap file
+      set -euo pipefail
+      MODE="${1:?mode}"
+      SIZE_MB="${2:-4096}"
+      SWAPFILE=/swapfile
+      # teardown
+      swapoff -a 2>/dev/null || true
+      cryptsetup close swap 2>/dev/null || true
+      for l in $(losetup -j "$SWAPFILE" 2>/dev/null | cut -d: -f1); do losetup -d "$l" || true; done
+      swapoff /dev/zram0 2>/dev/null || true
+      [ -b /dev/zram0 ] && (echo 1 > /sys/block/zram0/reset 2>/dev/null || true)
+      rm -f "$SWAPFILE"
+      echo "== mode=$MODE size=${SIZE_MB}MB =="
+      case "$MODE" in
+        enc-loop-fallocate)
+          fallocate -l "${SIZE_MB}M" "$SWAPFILE"; chmod 600 "$SWAPFILE"
+          loop=$(losetup -f --show "$SWAPFILE")
+          echo "loop=$loop (buffered)"
+          cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 512             --key-file /dev/urandom "$loop" swap
+          mkswap /dev/mapper/swap >/dev/null; swapon /dev/mapper/swap ;;
+        enc-loop-dd-dio)
+          rm -f "$SWAPFILE"
+          dd if=/dev/zero of="$SWAPFILE" bs=1M count="$SIZE_MB" status=none
+          chmod 600 "$SWAPFILE"
+          loop=$(losetup -f --show --direct-io=on "$SWAPFILE")
+          echo "loop line: $(losetup -l | grep "$loop")"
+          cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 512             --key-file /dev/urandom "$loop" swap
+          mkswap /dev/mapper/swap >/dev/null; swapon /dev/mapper/swap ;;
+        enc-blockdev)
+          dev=/dev/sdb
+          [ -b "$dev" ] || dev=/dev/vdb
+          [ -b "$dev" ] || { echo "no second block device"; exit 3; }
+          cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 512             --key-file /dev/urandom "$dev" swap
+          mkswap /dev/mapper/swap >/dev/null; swapon /dev/mapper/swap ;;
+        zram)
+          modprobe zram
+          echo lzo-rle > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+          echo "${SIZE_MB}M" > /sys/block/zram0/disksize
+          mkswap /dev/zram0 >/dev/null; swapon -p 100 /dev/zram0 ;;
+        plain-file)
+          fallocate -l "${SIZE_MB}M" "$SWAPFILE"; chmod 600 "$SWAPFILE"
+          mkswap "$SWAPFILE" >/dev/null; swapon "$SWAPFILE" ;;
+        *) echo "unknown mode $MODE"; exit 2 ;;
+      esac
+      echo "== swapon --show =="; swapon --show
+      echo "== lsblk =="; lsblk
